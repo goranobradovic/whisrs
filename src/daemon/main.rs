@@ -36,10 +36,7 @@ const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
     selected_text: String,
-    saved_clipboard: String,
     llm_config: llm::LlmConfig,
-    /// Whether the focused window is a terminal (use Ctrl+Shift+V to paste).
-    is_terminal: bool,
 }
 
 /// Shared daemon state protected by a mutex.
@@ -1789,74 +1786,20 @@ async fn command_mode_start(
     // Get LLM config.
     let llm_config = context.config.llm.clone().unwrap_or_default();
 
-    // Step 1: Get the selected text.
-    // Try primary selection first (works everywhere, no key simulation needed),
-    // then fall back to clipboard copy (Ctrl+C or Ctrl+Shift+C for terminals).
+    // Step 1: Capture the selected text. Command mode prefers the primary
+    // selection (the X highlight, distinct from the Ctrl+C clipboard), which
+    // needs no key simulation and leaves the clipboard untouched. When the
+    // primary selection is empty it falls back to a simulated Ctrl+C — sharing
+    // the same capture path as read-aloud — so command mode still works on apps
+    // and compositors that don't populate the primary selection. The LLM result
+    // is later typed through the same evdev / Wayland-vk injection pipeline as
+    // dictation, replacing the active selection in GUI apps and inserting at the
+    // prompt cursor in terminals.
     info!("command mode: getting selected text");
-    let clipboard = xkb_type::default_clipboard();
-
-    // Save current clipboard content so we can restore it later.
-    let saved_clipboard = clipboard.get_text().unwrap_or_default();
-
-    // Detect if the focused window is a terminal (for Ctrl+Shift+C/V fallback).
-    let is_terminal = context
-        .window_tracker
-        .get_focused_window_class()
-        .map(|c| is_terminal_class(&c))
-        .unwrap_or(false);
-
-    // Get selected text via primary selection (highlighted text, no key simulation).
-    // Then simulate copy (Ctrl+C or Ctrl+Shift+C for terminals) to keep the
-    // selection active so that paste will replace it rather than append.
-    let selected_text = clipboard.get_primary_selection().unwrap_or_default();
-
-    let copy_fn = if is_terminal {
-        simulate_terminal_copy
-    } else {
-        simulate_copy
+    let selected_text = match capture_selection(&context).await {
+        Ok(text) => text,
+        Err(message) => return Response::Error { message },
     };
-
-    match tokio::task::spawn_blocking(copy_fn).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            if selected_text.is_empty() {
-                return Response::Error {
-                    message: format!("failed to copy selection: {e}"),
-                };
-            }
-            // Copy failed but we have text from primary selection, continue.
-            warn!("copy simulation failed ({e}), using primary selection text");
-        }
-        Err(e) => {
-            if selected_text.is_empty() {
-                return Response::Error {
-                    message: format!("copy task panicked: {e}"),
-                };
-            }
-            warn!("copy task panicked ({e}), using primary selection text");
-        }
-    }
-
-    // If primary selection was empty, try the clipboard (copy may have worked).
-    let selected_text = if selected_text.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        match clipboard.get_text() {
-            Ok(text) => text,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("failed to read clipboard: {e}"),
-                };
-            }
-        }
-    } else {
-        selected_text
-    };
-
-    if selected_text.is_empty() || selected_text == saved_clipboard {
-        return Response::Error {
-            message: "no text selected — select some text before using command mode".to_string(),
-        };
-    }
 
     info!(
         "command mode: got {} chars of selected text",
@@ -1892,9 +1835,7 @@ async fn command_mode_start(
         ds.recording_started_at = Some(std::time::Instant::now());
         ds.command_mode = Some(CommandModeContext {
             selected_text,
-            saved_clipboard,
             llm_config,
-            is_terminal,
         });
     }
 
@@ -2053,45 +1994,35 @@ async fn command_mode_background(
             }
         };
 
-    // Paste the result, replacing the original selection.
-    info!("command mode: pasting {} chars", result.len());
-    let clipboard = xkb_type::default_clipboard();
-
-    if let Err(e) = clipboard.set_text(&result) {
-        error!("command mode: failed to set clipboard: {e}");
-        let mut ds = daemon_state.lock().await;
-        let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        return;
+    // Type the result at the cursor through the standard injection pipeline
+    // (uinput / Wayland virtual keyboard). The AltGr / dead-key work in
+    // xkb-type covers accented and non-ASCII output end-to-end, including in
+    // terminals where Ctrl+V is interpreted as a control character rather
+    // than paste — so the result is never routed through the clipboard.
+    // (The capture side may still fall back to a simulated Ctrl+C when the
+    // primary selection is empty; see `capture_selection`.)
+    //
+    // GUI apps: typing over an active selection highlight replaces it (X
+    // selection semantics) — equivalent to the old paste path, minus the
+    // clipboard save/restore race.
+    //
+    // Terminals: typing inserts at the prompt cursor. A previously-typed
+    // shell line is *not* cleared (the old Ctrl+A/Ctrl+K + paste path did
+    // that, but it could over-delete into scrollback). Users who want the
+    // selection overwritten should pre-clear it themselves.
+    info!("command mode: typing {} chars", result.len());
+    let text_clone = result.clone();
+    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+    let injector_backend = context.config.input.backend;
+    match tokio::task::spawn_blocking(move || {
+        type_text_at_cursor(&text_clone, key_delay, injector_backend)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("command mode: failed to type text: {e:#}"),
+        Err(e) => warn!("command mode: typing task panicked: {e}"),
     }
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    if cmd_ctx.is_terminal {
-        // In terminals, selections are a visual overlay — paste never replaces them.
-        // Clear the command line first (Ctrl+A → beginning, Ctrl+K → kill to end),
-        // then paste. Works across bash, zsh, and fish.
-        match tokio::task::spawn_blocking(simulate_terminal_clear_and_paste).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("failed to clear+paste in terminal: {e}"),
-            Err(e) => warn!("terminal clear+paste task panicked: {e}"),
-        }
-    } else {
-        match tokio::task::spawn_blocking(simulate_paste).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("failed to paste: {e}"),
-            Err(e) => warn!("paste task panicked: {e}"),
-        }
-    }
-
-    // Restore original clipboard after a delay.
-    let saved = cmd_ctx.saved_clipboard.clone();
-    let clipboard_restore = xkb_type::default_clipboard();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Err(e) = clipboard_restore.set_text(&saved) {
-            warn!("failed to restore clipboard: {e}");
-        }
-    });
 
     if context.config.general.audio_feedback {
         feedback::play_done(context.config.general.audio_feedback_volume);
@@ -2201,6 +2132,11 @@ fn simulate_terminal_copy() -> anyhow::Result<()> {
 }
 
 /// Simulate Ctrl+V (paste) via uinput.
+///
+/// Retained for easy reversion if command mode's terminal typing behavior
+/// needs the old clear-then-paste path back; not currently called — command
+/// mode now types via `type_text_at_cursor` (see `command_mode_background`).
+#[allow(dead_code)]
 fn simulate_paste() -> anyhow::Result<()> {
     simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V)
 }
@@ -2210,6 +2146,9 @@ fn simulate_paste() -> anyhow::Result<()> {
 /// In terminals, selections are visual overlays — paste inserts at cursor, never
 /// replaces the selection. So we clear the line first then paste the new content.
 /// Ctrl+A (beginning of line) + Ctrl+K (kill to end) works in bash, zsh, and fish.
+///
+/// Retained for easy reversion (see `simulate_paste`); not currently called.
+#[allow(dead_code)]
 fn simulate_terminal_clear_and_paste() -> anyhow::Result<()> {
     use evdev::{AttributeSet, EventType, InputEvent, Key};
     use std::thread;
@@ -2320,7 +2259,7 @@ fn leads_with_punct(text: &str) -> bool {
     ])
 }
 
-/// Capture the currently-selected text for read-aloud.
+/// Capture the currently-selected text for read-aloud and command mode.
 ///
 /// The primary selection (highlighted text) is authoritative when present: it
 /// needs no key simulation, so a non-empty primary selection is returned
@@ -2330,14 +2269,14 @@ fn leads_with_punct(text: &str) -> bool {
 ///
 /// When the primary selection is empty, fall back to a simulated Ctrl+C
 /// (Ctrl+Shift+C in terminals) and read the clipboard. A short settle delay
-/// precedes the simulated copy: the read-aloud hotkey is typically a modifier
+/// precedes the simulated copy: the triggering hotkey is typically a modifier
 /// combo (e.g. Alt+Shift+A), and if the user is still physically holding those
 /// modifiers when Ctrl+C fires, the app receives a garbled combo and the copy
 /// silently fails. The delay lets a briefly-held hotkey clear first.
 ///
 /// Returns `Ok(text)` on success, or `Err(message)` describing why nothing was
 /// captured (caller surfaces this as a `Response::Error` + notification).
-async fn capture_selection_for_speak(context: &DaemonContext) -> Result<String, String> {
+async fn capture_selection(context: &DaemonContext) -> Result<String, String> {
     let clipboard = xkb_type::default_clipboard();
 
     // Trust a non-empty primary selection directly — no copy, no equality check.
@@ -2378,7 +2317,7 @@ async fn capture_selection_for_speak(context: &DaemonContext) -> Result<String, 
     // With no primary selection, an unchanged clipboard means the copy captured
     // nothing (nothing selected, or the held hotkey garbled Ctrl+C).
     if copied.is_empty() || copied == saved_clipboard {
-        return Err("no text selected — select text before using read-aloud".to_string());
+        return Err("no text selected — select some text first".to_string());
     }
 
     Ok(copied)
@@ -2457,7 +2396,7 @@ async fn handle_speak(
     // (c) Capture the selection. On failure (incl. empty), surface an error
     // and — since this is hotkey-triggered — notify so the user sees why.
     info!("speak: getting selected text");
-    let selected_text = match capture_selection_for_speak(&context).await {
+    let selected_text = match capture_selection(&context).await {
         Ok(text) => text,
         Err(message) => {
             if context.notify_error() {
